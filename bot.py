@@ -148,6 +148,9 @@ async def get_media_session(dc_id):
     media_sessions.set(dc_id, client)
     return client
 
+@app.get("/ping")
+async def ping():
+    return {"status": "ok"}
 
 
 # === STREAMING ENDPOINT === #
