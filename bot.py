@@ -4,26 +4,30 @@ import mimetypes
 import math
 import logging
 from os import environ
+import random
+import time
+from collections import OrderedDict
+
 from dotenv import load_dotenv
-from telethon.sessions import StringSession
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse
+from telethon.sessions import StringSession
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError
 from telethon.tl.functions.upload import GetFileRequest
 from telethon.tl.functions.auth import ExportAuthorizationRequest, ImportAuthorizationRequest
 from telethon.tl.types import InputDocumentFileLocation, DocumentAttributeFilename
 
-from config import API_ID, API_HASH, BOT_TOKEN, BIN_CHANNEL, SESSION_STRING
+from config import API_ID, API_HASH, BIN_CHANNEL, SESSION_STRING, BOT_TOKENS  # <-- multiple tokens in list
 from crypto import decrypt_msg_id
 
 load_dotenv()
 
-client = TelegramClient(StringSession(SESSION_STRING), int(API_ID), API_HASH)
-MAX_TELEGRAM_CHUNK = 512 * 1024  # 512KB
+MAX_TELEGRAM_CHUNK = 512 * 1024
 CACHE_CLEAN_INTERVAL = 30 * 60
 MAX_CONCURRENT_DOWNLOADS = 5
 
+random.seed(42)
 active_ips = set()
 cached_file_ids = {}
 download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
@@ -31,14 +35,27 @@ download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-from collections import OrderedDict
-import time
 
+# === MULTI BOT CLIENTS === #
+bot_clients = []
+
+async def init_bot_clients():
+    for token in BOT_TOKENS:
+        client = TelegramClient(f"bot_{token[:6]}", int(API_ID), API_HASH)
+        await client.start(bot_token=token)
+        bot_clients.append(client)
+        logger.info(f"Bot client initialized for token ending with ...{token[-5:]}")
+
+def get_random_client():
+    return random.choice(bot_clients)
+
+
+# === DC SESSION CACHE === #
 class DCCache:
     def __init__(self, max_size=5, ttl=1800):
         self.sessions = OrderedDict()
         self.max_size = max_size
-        self.ttl = ttl  # seconds
+        self.ttl = ttl
 
     def _evict_expired(self):
         now = time.time()
@@ -58,7 +75,7 @@ class DCCache:
         self._evict_expired()
         if dc_id in self.sessions:
             ts, client = self.sessions.pop(dc_id)
-            self.sessions[dc_id] = (time.time(), client)  # update timestamp
+            self.sessions[dc_id] = (time.time(), client)
             return client
         return None
 
@@ -66,7 +83,7 @@ class DCCache:
         self.sessions[dc_id] = (time.time(), client)
         self._evict_if_needed()
 
-media_sessions = DCCache(max_size=5, ttl=5000)  # Max 5 DCs, TTL 30 min
+media_sessions = DCCache(max_size=5, ttl=5000)
 
 
 # === FLOODWAIT WRAPPER === #
@@ -91,38 +108,36 @@ def floodwait_retry(func):
 
 @floodwait_retry
 async def safe_get_messages(*args, **kwargs):
-    return await client.get_messages(*args, **kwargs)
+    return await get_random_client().get_messages(*args, **kwargs)
 
 @floodwait_retry
 async def safe_export_auth(dc_id):
-    return await client(ExportAuthorizationRequest(dc_id=dc_id))
+    return await get_random_client()(ExportAuthorizationRequest(dc_id=dc_id))
 
 @floodwait_retry
 async def safe_import_auth(dc_client, auth):
     return await dc_client(ImportAuthorizationRequest(id=auth.id, bytes=auth.bytes))
 
 
-# === FASTAPI LIFESPAN === #
+# === FASTAPI APP === #
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    logger.info("Starting bot")
-    await client.start()
+    logger.info("Starting bot pool...")
+    await init_bot_clients()
     asyncio.create_task(clean_cache())
     yield
-    logger.info("Shutting down: Disconnecting all clients")
-    await client.disconnect()
-    for dc_id, dc_client in media_sessions.items():
+    logger.info("Shutting down all clients...")
+    for client in bot_clients:
+        await client.disconnect()
+    for _, dc_client in media_sessions.sessions.values():
         try:
             await dc_client.disconnect()
-            logger.info(f"Disconnected client for DC {dc_id}")
-        except Exception as e:
-            logger.warning(f"Failed to disconnect client for DC {dc_id}: {e}")
-
+        except Exception:
+            pass
 
 app = FastAPI(lifespan=lifespan)
 
 
-# === CLEAN CACHE PERIODICALLY === #
 async def clean_cache():
     while True:
         await asyncio.sleep(CACHE_CLEAN_INTERVAL)
@@ -130,7 +145,6 @@ async def clean_cache():
         logger.debug("Cleaned file ID cache")
 
 
-# === MULTI-DC SESSION HANDLING === #
 async def get_media_session(dc_id):
     client = media_sessions.get(dc_id)
     if client and await client.is_connected():
@@ -148,12 +162,7 @@ async def get_media_session(dc_id):
     media_sessions.set(dc_id, client)
     return client
 
-@app.get("/ping")
-async def ping():
-    return {"status": "ok"}
 
-
-# === STREAMING ENDPOINT === #
 @app.get("/stream/{msg_id}")
 async def stream_handler(msg_id: str, request: Request):
     ip = request.client.host
@@ -162,10 +171,9 @@ async def stream_handler(msg_id: str, request: Request):
     active_ips.add(ip)
 
     try:
-        async with download_semaphore:  # Limit concurrent downloads
+        async with download_semaphore:
             msg_id = decrypt_msg_id(msg_id)
 
-            # Use cached message if available
             if msg_id in cached_file_ids:
                 message = cached_file_ids[msg_id]
             else:
@@ -185,7 +193,6 @@ async def stream_handler(msg_id: str, request: Request):
             mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
             disposition = "inline" if "video/" in mime_type or "audio/" in mime_type else "attachment"
 
-            # Parse range
             range_header = request.headers.get("range")
             start = 0
             end = file_size - 1
@@ -213,7 +220,7 @@ async def stream_handler(msg_id: str, request: Request):
                 parts = last_part - first_part
                 current = 1
                 try:
-                    async for chunk in client.iter_download(message, offset=offset, limit=parts, chunk_size=limit, file_size=file_size):
+                    async for chunk in get_random_client().iter_download(message, offset=offset, limit=parts, chunk_size=limit, file_size=file_size):
                         if current == 1:
                             yield chunk[first_cut:]
                         elif current == parts:
