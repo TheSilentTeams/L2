@@ -18,7 +18,7 @@ from telethon.tl.functions.upload import GetFileRequest
 from telethon.tl.functions.auth import ExportAuthorizationRequest, ImportAuthorizationRequest
 from telethon.tl.types import InputDocumentFileLocation, DocumentAttributeFilename
 
-from config import API_ID, API_HASH, BIN_CHANNEL, SESSION_STRING, BOT_TOKENS  # <-- multiple tokens in list
+from config import API_ID, API_HASH, BIN_CHANNEL, BOT_TOKENS  # <-- multiple tokens in list
 from crypto import decrypt_msg_id
 
 load_dotenv()
